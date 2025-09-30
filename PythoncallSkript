@@ -1,7 +1,7 @@
 using PythonCall
 
 # === CONFIGURATION ===
-root_modulename = "biotite.sequence.align"
+root_modulename = ""
 out_file = "wrapped_pythoncall_$(replace(root_modulename, "." => "_")).jl"
 
 inspect = pyimport("inspect")
