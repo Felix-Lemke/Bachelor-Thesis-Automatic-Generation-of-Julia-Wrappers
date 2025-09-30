@@ -1,0 +1,205 @@
+using PythonCall
+
+# === CONFIGURATION ===
+root_modulename = "biotite.sequence.align"
+out_file = "wrapped_pythoncall_$(replace(root_modulename, "." => "_")).jl"
+
+inspect = pyimport("inspect")
+builtins = pyimport("builtins")
+
+visited_modules = Set{String}()
+modname_to_varname = Dict{String, String}()
+max_depth = 0  # 0 = only top module
+
+# === HELPERS ===
+
+# Get all public names of a module/class
+get_public_names(py_mod) = [string(n) for n in builtins.dir(py_mod) if !startswith(string(n), "_")]
+
+# Skip some classes like int/float type wrappers
+should_skip_class(name, obj) = occursin(r"^u?int\d+$", name) || occursin(r"^float\d+$", name)
+
+# Python classes in a module
+function get_classes(py_mod)
+    Dict(name => pygetattr(py_mod, name) for name in get_public_names(py_mod) if begin
+        obj = pygetattr(py_mod, name)
+        Bool(inspect.isclass(obj)) && !should_skip_class(name, obj)
+    end)
+end
+
+# Python functions in a module
+function get_functions(py_mod)
+    Dict(name => pygetattr(py_mod, name) for name in get_public_names(py_mod) if begin
+        obj = pygetattr(py_mod, name)
+        Bool(inspect.isfunction(obj)) || Bool(inspect.isbuiltin(obj))
+    end)
+end
+
+# Python submodules
+function get_submodules(py_mod)
+    Dict(name => pygetattr(py_mod, name) for name in get_public_names(py_mod) if begin
+        obj = pygetattr(py_mod, name)
+        Bool(inspect.ismodule(obj))
+    end)
+end
+
+# Python constants (non-function, non-class, non-module)
+function get_constants(py_mod)
+    Dict(name => pygetattr(py_mod, name) for name in get_public_names(py_mod) if begin
+        obj = pygetattr(py_mod, name)
+        !( (Bool(inspect.isclass(obj)) && !should_skip_class(name, obj)) ||
+           Bool(inspect.isfunction(obj)) ||
+           Bool(inspect.ismodule(obj)) )
+    end)
+end
+
+# === GENERATE WRAPPERS ===
+
+# Simple function wrapper
+function generate_wrapper(name::String, py_func::Py, modulename::String)
+    julia_mod = modname_to_varname[modulename]
+    return """
+function $name(args...; kwargs...)
+    return pyconvert(Any, pygetattr($julia_mod, "$name")(args...; kwargs...))
+end
+"""
+end
+
+# Class wrapper
+function generate_class_wrapper(classname::String, py_class::Py, modulename::String)
+    julia_mod = modname_to_varname[modulename]
+
+    # --- Struct + inner constructor ---
+    struct_code = """
+struct $classname
+    py::Py
+    $classname(py::Py) = new(py)
+end
+
+# Automatic conversion to Python object
+Base.convert(::Type{Py}, self::$classname) = self.py
+"""
+
+    # --- User-facing constructor ---
+    constructor_code = """
+function $classname(args...; kwargs...)
+    py_obj = pygetattr($julia_mod, "$classname")(args...; kwargs...)
+    return $classname(py_obj)
+end
+"""
+
+    # --- Instance methods ---
+    instance_syms = Symbol[]
+    for name_py in get_public_names(py_class)
+        name = string(name_py)
+        if startswith(name, "_") || name == "__init__"
+            continue
+        end
+        method = try pygetattr(py_class, name) catch _ continue end
+        if Bool(inspect.isroutine(method)) || Bool(inspect.isfunction(method)) || Bool(inspect.ismethoddescriptor(method))
+            push!(instance_syms, Symbol(name))
+        end
+    end
+    instance_syms_code = isempty(instance_syms) ? "Set{Symbol}()" : "Set(" * string(instance_syms) * ")"
+
+    getproperty_instance_code = """
+function Base.getproperty(self::$classname, name::Symbol)
+    if name == :py
+        return getfield(self, :py)
+    elseif name in $instance_syms_code
+        return (args...; kwargs...) -> pyconvert(Any,
+            pygetattr(self.py, String(name))(args...; kwargs...))
+    else
+        return pyconvert(Any, pygetattr(self.py, String(name)))
+    end
+end
+"""
+
+    # --- Static/class methods ---
+    static_syms = Symbol[]
+    cls_dict = pygetattr(py_class, "__dict__")
+    for name_py in get_public_names(py_class)
+        name = string(name_py)
+        if startswith(name, "_")
+            continue
+        end
+
+        method = try pygetattr(py_class, name) catch _ continue end
+        is_static = pyhasattr(cls_dict, name) && pytype(pygetattr(cls_dict, name)) == pybuiltins.staticmethod
+        if Bool(inspect.isroutine(method)) || is_static
+            push!(static_syms, Symbol(name))
+        end
+    end
+    static_syms_code = isempty(static_syms) ? "Set{Symbol}()" : "Set(" * string(static_syms) * ")"
+
+    getproperty_static_code = """
+function Base.getproperty(::Type{$classname}, name::Symbol)
+    if name in $static_syms_code
+        return (args...; kwargs...) -> pyconvert(Any,
+            pygetattr($julia_mod.$classname, String(name))(args...; kwargs...))
+    else
+        return getfield($classname, name)
+    end
+end
+"""
+
+    return struct_code * constructor_code * getproperty_instance_code * getproperty_static_code
+end
+
+
+# Recursive module wrapper
+function wrap_module(io, modulename::String, py_mod::Py; depth::Int=0, max_depth::Int=0)
+    if modulename in visited_modules || depth > max_depth
+        return
+    end
+    push!(visited_modules, modulename)
+
+    julia_modname = replace(replace(modulename, "." => "_"), "-" => "_")
+    modname_to_varname[modulename] = julia_modname
+    println(io, "const $julia_modname = pyimport(\"$modulename\")\n")
+
+    # Functions
+    for (name, func) in sort(collect(get_functions(py_mod)); by=first)
+        println(io, generate_wrapper(name, func, modulename))
+    end
+
+    # Classes
+    for (name, cls) in sort(collect(get_classes(py_mod)); by=first)
+        println(io, generate_class_wrapper(name, cls, modulename))
+    end
+
+    # Constants
+    wrapped_names = Set{String}(keys(get_functions(py_mod))) ∪ Set(keys(get_classes(py_mod)))
+    for (name, val) in sort(collect(get_constants(py_mod)); by=first)
+        if name in wrapped_names
+            continue
+        end
+        try
+            jlval = pyconvert(Any, val)
+            if isa(jlval, Union{Bool, Integer, AbstractFloat, String})
+                println(io, "const $name = $(repr(jlval))")
+            else
+                println(io, "const $name = pyconvert(Any, pygetattr($julia_modname, \"$name\"))")
+            end
+        catch
+            println(io, "const $name = pygetattr($julia_modname, \"$name\")")
+        end
+    end
+
+    # Submodules
+    for (name, submod) in sort(collect(get_submodules(py_mod)); by=first)
+        wrap_module(io, "$modulename.$name", submod; depth=depth+1, max_depth=max_depth)
+    end
+end
+
+# === MAIN ===
+py_mod = pyimport(root_modulename)
+
+open(out_file, "w") do io
+    println(io, "module wrapped_pythoncall_$(replace(root_modulename, "." => "_"))")
+    println(io, "using PythonCall\n")
+    wrap_module(io, root_modulename, py_mod; max_depth=max_depth)
+    println(io, "end")
+end
+
+println("Wrapper written to: $out_file")
